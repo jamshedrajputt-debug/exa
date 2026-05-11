@@ -1,5 +1,50 @@
-const socket = io(window.location.origin);
+const socket = io(window.location.origin, {
+    transports: ["websocket", "polling"],
+    maxHttpBufferSize: 10 * 1024 * 1024,
+    reconnection: true,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 5000,
+    reconnectionAttempts: 5,
+    timeout: 20000
+});
 let user = "";
+
+socket.on("connect", () => {
+    console.log("Socket connected.");
+    if (user) {
+        socket.emit("join", user);
+    }
+    flushPendingMessages();
+});
+
+socket.on("reconnect", () => {
+    console.log("Socket reconnected.");
+    flushPendingMessages();
+});
+
+socket.on("connect_error", (err) => {
+    console.error("Socket connect error:", err);
+});
+
+socket.on("reconnect_error", (err) => {
+    console.error("Socket reconnect error:", err);
+});
+
+socket.on("disconnect", (reason) => {
+    console.warn("Socket disconnected:", reason);
+});
+
+function enqueuePendingMessage(payload, tempId, retryCount = 0) {
+    pendingMessageQueue.push({ payload, tempId, retryCount });
+}
+
+function flushPendingMessages() {
+    if (!socket.connected) return;
+    while (pendingMessageQueue.length > 0) {
+        const { payload, tempId, retryCount } = pendingMessageQueue.shift();
+        sendEncryptedMessage(payload, tempId, retryCount);
+    }
+}
 let avatar = "";
 let currentChat = "";
 let recipient = "";
@@ -16,44 +61,44 @@ let currentCallTarget = "";
 let incomingCall = false;
 let pendingOffer = null;
 let typingTimer;
+let isTyping = false;
 let editingMessageId = null;
 let savedUsername = localStorage.getItem("savedUsername") || "";
 let publicKeys = {};
+let publicKeyPromises = {};
 let privateKey = null;
 let myPublicKey = null;
 let myPublicKeyString = "";
 let inactivityTimer;
 let activityListenersAdded = false;
-const INACTIVITY_TIMEOUT = 3 * 60 * 1000; // 3 minutes
+const INACTIVITY_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 let pendingStopRecording = false;
+let pendingMessageQueue = [];
 let chats = {}; // Store chat data
 let onlineUsers = [];
 let currentReply = null;
 let messageReactions = {}; // Store reactions for messages
 let currentZoom = 100; // Track zoom level
-let chatBubbleColor = localStorage.getItem("chatBubbleColor") || "#0095f6";
+let currentTheme = localStorage.getItem("appTheme") || "dark";
+let isSending = false;
 
-function shadeColor(color, percent) {
-    let R = parseInt(color.substring(1,3),16);
-    let G = parseInt(color.substring(3,5),16);
-    let B = parseInt(color.substring(5,7),16);
-    R = Math.min(255, Math.max(0, R + Math.round(255 * (percent / 100))));
-    G = Math.min(255, Math.max(0, G + Math.round(255 * (percent / 100))));
-    B = Math.min(255, Math.max(0, B + Math.round(255 * (percent / 100))));
-    const r = R.toString(16).padStart(2, '0');
-    const g = G.toString(16).padStart(2, '0');
-    const b = B.toString(16).padStart(2, '0');
-    return `#${r}${g}${b}`;
-}
-
-function applyChatTheme() {
+function applyTheme(theme) {
     const root = document.documentElement;
-    root.style.setProperty("--blue", chatBubbleColor);
-    root.style.setProperty("--message-bg-me", chatBubbleColor);
-    root.style.setProperty("--blue-hover", shadeColor(chatBubbleColor, -15));
+    root.setAttribute("data-theme", theme);
+    localStorage.setItem("appTheme", theme);
+    currentTheme = theme;
 }
 
-applyChatTheme();
+function initTheme() {
+    applyTheme(currentTheme);
+    const themeSelector = document.getElementById("themeSelector");
+    if (themeSelector) {
+        themeSelector.value = currentTheme;
+        themeSelector.addEventListener("change", (e) => {
+            applyTheme(e.target.value);
+        });
+    }
+}
 
 async function fileToDataUrl(file) {
     return new Promise((resolve, reject) => {
@@ -186,15 +231,34 @@ async function sendImage(file) {
         const recipientPublicKey = await getPublicKeyFor(currentChat);
         const encrypted = await encryptMessage(base64, recipientPublicKey, myPublicKey, currentChat);
         const tempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const localMessage = {
+            from: user,
+            to: currentChat,
+            type: "image",
+            imageData: base64,
+            tempId,
+            status: "sending",
+            avatar,
+            time: new Date().toISOString()
+        };
+        if (!chats[currentChat]) {
+            chats[currentChat] = { messages: [], unreadCount: 0, lastMessage: null, avatar: getDefaultAvatar(currentChat) };
+        }
+        chats[currentChat].messages.push(localMessage);
+        if (currentChat === localMessage.to) {
+            addMessage(localMessage);
+            updateChatUI();
+            autoScrollMessages();
+        }
 
-        socket.emit("message", {
+        sendEncryptedMessage({
             to: currentChat,
             type: "image",
             ciphertext: encrypted.ciphertext,
             iv: encrypted.iv,
             encryptedKeys: encrypted.encryptedKeys,
             tempId
-        });
+        }, tempId);
     } catch (err) {
         console.error(err);
         alert("Failed to send image.");
@@ -212,15 +276,34 @@ async function sendVideo(file) {
         const recipientPublicKey = await getPublicKeyFor(currentChat);
         const encrypted = await encryptMessage(base64, recipientPublicKey, myPublicKey, currentChat);
         const tempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const localMessage = {
+            from: user,
+            to: currentChat,
+            type: "video",
+            videoData: base64,
+            tempId,
+            status: "sending",
+            avatar,
+            time: new Date().toISOString()
+        };
+        if (!chats[currentChat]) {
+            chats[currentChat] = { messages: [], unreadCount: 0, lastMessage: null, avatar: getDefaultAvatar(currentChat) };
+        }
+        chats[currentChat].messages.push(localMessage);
+        if (currentChat === localMessage.to) {
+            addMessage(localMessage);
+            updateChatUI();
+            autoScrollMessages();
+        }
 
-        socket.emit("message", {
+        sendEncryptedMessage({
             to: currentChat,
             type: "video",
             ciphertext: encrypted.ciphertext,
             iv: encrypted.iv,
             encryptedKeys: encrypted.encryptedKeys,
             tempId
-        });
+        }, tempId);
     } catch (err) {
         console.error(err);
         alert("Failed to send video.");
@@ -242,8 +325,31 @@ async function sendFile(file) {
             data: base64
         }), recipientPublicKey, myPublicKey, currentChat);
         const tempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const localMessage = {
+            from: user,
+            to: currentChat,
+            type: "file",
+            fileData: {
+                name: file.name,
+                size: file.size,
+                data: base64
+            },
+            tempId,
+            status: "sending",
+            avatar,
+            time: new Date().toISOString()
+        };
+        if (!chats[currentChat]) {
+            chats[currentChat] = { messages: [], unreadCount: 0, lastMessage: null, avatar: getDefaultAvatar(currentChat) };
+        }
+        chats[currentChat].messages.push(localMessage);
+        if (currentChat === localMessage.to) {
+            addMessage(localMessage);
+            updateChatUI();
+            autoScrollMessages();
+        }
 
-        socket.emit("message", {
+        sendEncryptedMessage({
             to: currentChat,
             type: "file",
             fileName: file.name,
@@ -251,7 +357,7 @@ async function sendFile(file) {
             iv: encrypted.iv,
             encryptedKeys: encrypted.encryptedKeys,
             tempId
-        });
+        }, tempId);
     } catch (err) {
         console.error(err);
         alert("Failed to send file.");
@@ -335,7 +441,7 @@ function filterChats() {
     });
 }
 
-function updateChatUI() {
+function updateChatUI(updateMessages = true) {
     // Update sidebar chats
     const chatsList = document.getElementById("chatsList");
     chatsList.innerHTML = "";
@@ -384,18 +490,22 @@ function updateChatUI() {
     });
 
     // Update main chat area
-    if (currentChat) {
+    if (updateMessages && currentChat) {
         document.getElementById("chatTitle").innerText = currentChat;
         document.getElementById("headerAvatar").src = chats[currentChat]?.avatar || getDefaultAvatar(currentChat);
         document.getElementById("chatSubtitle").innerText = onlineUsers.includes(currentChat) ? "Active now" : "Offline";
 
         // Clear messages and load current chat messages
+        console.log("Clearing messages in updateChatUI for currentChat:", currentChat);
         document.getElementById("messages").innerHTML = "";
         if (chats[currentChat]) {
             chats[currentChat].messages.forEach(msg => addMessage(msg));
             chats[currentChat].unreadCount = 0;
         }
-    } else {
+    } else if (!updateMessages && currentChat) {
+        // Only update subtitle for online status
+        document.getElementById("chatSubtitle").innerText = onlineUsers.includes(currentChat) ? "Active now" : "Offline";
+    } else if (!currentChat) {
         document.getElementById("chatTitle").innerText = "Select a chat";
         document.getElementById("chatSubtitle").innerText = "Tap to start chatting";
         document.getElementById("headerAvatar").src = avatar || "https://i.pravatar.cc/40";
@@ -404,14 +514,34 @@ function updateChatUI() {
 }
 
 function selectChat(chatUser) {
+    if (currentChat === chatUser) {
+        // Already selected, just ensure UI is up to date
+        return;
+    }
     currentChat = chatUser;
     recipient = chatUser;
     localStorage.setItem("sessionCurrentChat", currentChat);
     if (chats[chatUser]) {
         chats[chatUser].unreadCount = 0;
     }
-    updateChatUI();
+    // updateChatUI(); // Removed to prevent blinking, let loadMessages handle it
     socket.emit("join", user);
+    void preloadPublicKey(chatUser);
+    if (window.matchMedia('(max-width: 960px)').matches) {
+        document.querySelector('.chat-container')?.classList.remove('sidebar-open');
+    }
+}
+
+function toggleSidebar() {
+    document.querySelector('.chat-container')?.classList.toggle('sidebar-open');
+}
+
+async function preloadPublicKey(username) {
+    try {
+        await getPublicKeyFor(username);
+    } catch (err) {
+        console.warn("Unable to preload public key for", username, err);
+    }
 }
 
 function addReactionToMessage(messageId, emoji) {
@@ -517,24 +647,47 @@ async function sendRecordedAudio() {
     if (!recordedAudioBlob) {
         return;
     }
+
+    let tempId;
     try {
         const recipientPublicKey = await getPublicKeyFor(currentChat);
         const base64Audio = await blobToBase64(recordedAudioBlob);
         const encrypted = await encryptMessage(base64Audio, recipientPublicKey, myPublicKey, currentChat);
-        const tempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        tempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const localMessage = {
+            from: user,
+            to: currentChat,
+            type: "audio",
+            audioBase64: base64Audio,
+            tempId,
+            status: "sending",
+            avatar,
+            time: new Date().toISOString()
+        };
 
-        socket.emit("message", {
+        if (!chats[currentChat]) {
+            chats[currentChat] = { messages: [], unreadCount: 0, lastMessage: null, avatar: getDefaultAvatar(currentChat) };
+        }
+        chats[currentChat].messages.push(localMessage);
+        if (currentChat === localMessage.to) {
+            addMessage(localMessage);
+            updateChatUI();
+            autoScrollMessages();
+        }
+
+        sendEncryptedMessage({
             to: currentChat,
             type: "audio",
             ciphertext: encrypted.ciphertext,
             iv: encrypted.iv,
             encryptedKeys: encrypted.encryptedKeys,
             tempId
-        });
+        }, tempId);
 
         clearRecording();
     } catch (err) {
         console.error(err);
+        console.warn(`Unable to send audio message ${tempId} right now. It will remain in sending state.`);
         alert(err.message || "Unable to send audio message.");
     }
 }
@@ -764,6 +917,8 @@ async function login() {
         }
 
         enterChat();
+        // Preload public keys for faster messaging
+        preloadAllPublicKeys();
     } catch (err) {
         console.error(err);
         alert("Login failed. Please try again.");
@@ -771,6 +926,22 @@ async function login() {
 }
 
 window.login = login;
+
+async function preloadAllPublicKeys() {
+    try {
+        const response = await fetch('/users');
+        const data = await response.json();
+        if (data.success) {
+            for (const userData of data.users) {
+                if (userData.username !== user && !publicKeys[userData.username] && !publicKeyPromises[userData.username]) {
+                    prefetchPublicKey(userData.username);
+                }
+            }
+        }
+    } catch (err) {
+        console.warn("Failed to preload public keys:", err);
+    }
+}
 
 function logout() {
     endCall();
@@ -1153,6 +1324,7 @@ function selectUserFromList(username) {
     closeUsersModal();
     updateChatUI();
     socket.emit("join", user);
+    prefetchPublicKey(currentChat);
 }
 
 function setRecipient() {
@@ -1228,18 +1400,33 @@ function renderOnlineUsers(list) {
             if (title) title.innerText = currentChat;
             document.getElementById("messages").innerHTML = "";
             socket.emit("join", user);
+            prefetchPublicKey(currentChat);
         };
         container.appendChild(item);
     });
 }
 
 function handleKeyPress(event) {
-    if (event.key === "Enter") {
+    if (currentChat && !publicKeys[currentChat] && !publicKeyPromises[currentChat]) {
+        prefetchPublicKey(currentChat);
+    }
+
+    if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.altKey) {
+        event.preventDefault();
         sendMsg();
-    } else if (currentChat) {
-        socket.emit("typing", currentChat);
+        return;
+    }
+
+    if (currentChat) {
+        if (!isTyping) {
+            socket.emit("typing", currentChat);
+            isTyping = true;
+        }
         clearTimeout(typingTimer);
-        typingTimer = setTimeout(() => socket.emit("stopTyping", currentChat), 1000);
+        typingTimer = setTimeout(() => {
+            socket.emit("stopTyping", currentChat);
+            isTyping = false;
+        }, 500); // Reduced from 900 to 500ms
     }
 }
 
@@ -1339,14 +1526,14 @@ async function startRecording() {
                             const encrypted = await encryptMessage(base64Audio, recipientPublicKey, myPublicKey, currentChat);
                             const tempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
                             
-                            socket.emit("message", {
+                            sendEncryptedMessage({
                                 to: currentChat,
                                 type: "audio",
                                 ciphertext: encrypted.ciphertext,
                                 iv: encrypted.iv,
                                 encryptedKeys: encrypted.encryptedKeys,
                                 tempId
-                            });
+                            }, tempId);
                             
                             clearRecording();
                         } catch (err) {
@@ -1462,15 +1649,34 @@ async function sendAudioMsg() {
         const base64Audio = await blobToBase64(recordedAudioBlob);
         const encrypted = await encryptMessage(base64Audio, recipientPublicKey, myPublicKey, currentChat);
         const tempId = Date.now().toString();
+        const localMessage = {
+            from: user,
+            to: currentChat,
+            type: "audio",
+            audioBase64: base64Audio,
+            tempId,
+            status: "sending",
+            avatar,
+            time: new Date().toISOString()
+        };
+        if (!chats[currentChat]) {
+            chats[currentChat] = { messages: [], unreadCount: 0, lastMessage: null, avatar: getDefaultAvatar(currentChat) };
+        }
+        chats[currentChat].messages.push(localMessage);
+        if (currentChat === localMessage.to) {
+            addMessage(localMessage);
+            updateChatUI();
+            autoScrollMessages();
+        }
 
-        socket.emit("message", {
+        sendEncryptedMessage({
             to: currentChat,
             type: "audio",
             ciphertext: encrypted.ciphertext,
             iv: encrypted.iv,
             encryptedKeys: encrypted.encryptedKeys,
             tempId
-        });
+        }, tempId);
 
         clearRecording();
         document.getElementById("msg").value = "";
@@ -1489,7 +1695,21 @@ function blobToBase64(blob) {
     });
 }
 
+let encryptionWorker = null;
+
+function getEncryptionWorker() {
+    if (!encryptionWorker) {
+        encryptionWorker = new Worker('encrypt-worker.js');
+    }
+    return encryptionWorker;
+}
+
 async function sendMsg() {
+    if (isSending) return; // Prevent multiple sends
+    if (!socket.connected) {
+        alert("Not connected to server. Please refresh the page or access at http://localhost:3000");
+        return;
+    }
     const msg = document.getElementById("msg").value.trim();
     if (!msg) return;
     if (!currentChat) {
@@ -1501,38 +1721,65 @@ async function sendMsg() {
         return;
     }
 
+    console.log("Sending message:", msg, "to", currentChat);
+    isSending = true;
+
+    const tempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const localMessage = {
+        from: user,
+        to: currentChat,
+        msg,
+        type: "text",
+        tempId,
+        status: "sending",
+        avatar,
+        time: new Date().toISOString(),
+        replyTo: currentReply ? {
+            id: currentReply.messageId,
+            from: currentReply.replyToUser,
+            text: currentReply.replyToText
+        } : null
+    };
+
+    if (!chats[currentChat]) {
+        chats[currentChat] = { messages: [], unreadCount: 0, lastMessage: null, avatar: getDefaultAvatar(currentChat) };
+    }
+    chats[currentChat].messages.push(localMessage);
+    if (currentChat === localMessage.to) {
+        addMessage(localMessage);
+        updateChatUI();
+        autoScrollMessages();
+    }
+
+    // Clear input immediately for fast typing
+    document.getElementById("msg").value = "";
+    cancelReply();
+    socket.emit("stopTyping", currentChat);
+
     try {
         const recipientPublicKey = await getPublicKeyFor(currentChat);
+        console.log("Recipient public key obtained, encrypting message...");
         const encrypted = await encryptMessage(msg, recipientPublicKey, myPublicKey, currentChat);
-        const tempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
         const messagePayload = {
             to: currentChat,
             ciphertext: encrypted.ciphertext,
             iv: encrypted.iv,
             encryptedKeys: encrypted.encryptedKeys,
-            tempId
+            tempId,
+            type: "text"
         };
-        if (currentReply) {
-            messagePayload.replyTo = {
-                id: currentReply.messageId,
-                from: currentReply.replyToUser,
-                text: currentReply.replyToText
-            };
+        if (localMessage.replyTo) {
+            messagePayload.replyTo = localMessage.replyTo;
         }
-
-        socket.emit("message", messagePayload, (ack) => {
-            if (!ack) {
-                alert("Message delivery failed. Please try again.");
-            }
-        });
-
-        document.getElementById("msg").value = "";
-        cancelReply();
-        socket.emit("stopTyping", currentChat);
+        console.log("Sending encrypted message to server...");
+        sendEncryptedMessage(messagePayload, tempId);
     } catch (err) {
-        console.error(err);
+        console.error("Encryption/send error:", err);
+        console.warn(`Unable to send message ${tempId} right now. It will remain in sending state.`);
         alert(err.message || "Unable to send encrypted message.");
+        updateMessageStatus(tempId, "failed");
+    } finally {
+        isSending = false;
     }
 }
 
@@ -1547,6 +1794,9 @@ socket.on("loadMessages", async (msgs) => {
             chats[chatUser] = { messages: [], unreadCount: 0, lastMessage: null, avatar: getDefaultAvatar(chatUser) };
         }
         const decrypted = await tryDecryptMessage(msg);
+        if (decrypted.from === user) {
+            decrypted.status = decrypted.read ? "seen" : "sent";
+        }
         chats[chatUser].messages.push(decrypted);
         if (!chats[chatUser].lastMessage || new Date(decrypted.time) > new Date(chats[chatUser].lastMessage.time)) {
             chats[chatUser].lastMessage = decrypted;
@@ -1575,6 +1825,7 @@ socket.on("loadMessages", async (msgs) => {
 });
 
 socket.on("message", async (data) => {
+    console.log("Received message from server:", data);
     const chatUser = data.from === user ? data.to : data.from;
     if (!chats[chatUser]) {
         chats[chatUser] = { messages: [], unreadCount: 0, lastMessage: null, avatar: getDefaultAvatar(chatUser) };
@@ -1582,14 +1833,32 @@ socket.on("message", async (data) => {
 
     const decrypted = await tryDecryptMessage(data);
     if (decrypted) {
-        chats[chatUser].messages.push(decrypted);
+        if (decrypted.from === user) {
+            decrypted.status = decrypted.read ? "seen" : "sent";
+        }
+        const existingMessage = getMessageById(chatUser, decrypted.id) || getMessageById(chatUser, decrypted.tempId);
+        if (existingMessage) {
+            Object.assign(existingMessage, decrypted, { status: "sent" });
+            const existingMessageId = existingMessage.tempId || existingMessage.id;
+            if (chatUser === currentChat) {
+                updateMessageStatus(existingMessageId, "sent");
+            }
+        } else {
+            chats[chatUser].messages.push(decrypted);
+            if (chatUser === currentChat && decrypted.tempId) {
+                updateMessageStatus(decrypted.tempId, "sent");
+            }
+        }
         chats[chatUser].lastMessage = decrypted;
 
         if (chatUser !== currentChat) {
             chats[chatUser].unreadCount++;
+            updateChatUI();
         }
-        updateChatUI();
         if (chatUser === currentChat) {
+            if (!existingMessage) {
+                addMessage(decrypted);
+            }
             autoScrollMessages();
         }
     }
@@ -1597,11 +1866,14 @@ socket.on("message", async (data) => {
 
 socket.on("onlineUsers", (list) => {
     onlineUsers = list;
-    updateChatUI();
-    if (currentChat && onlineUsers.includes(currentChat)) {
-        document.getElementById("chatSubtitle").innerText = "Active now";
-    } else if (currentChat) {
-        document.getElementById("chatSubtitle").innerText = "Offline";
+    updateChatUI(false);
+    if (currentChat) {
+        prefetchPublicKey(currentChat);
+        if (onlineUsers.includes(currentChat)) {
+            document.getElementById("chatSubtitle").innerText = "Active now";
+        } else {
+            document.getElementById("chatSubtitle").innerText = "Offline";
+        }
     }
 });
 
@@ -1616,8 +1888,20 @@ socket.on("stopTyping", () => {
     document.getElementById("typingIndicator").style.display = "none";
 });
 
-socket.on("errorMessage", (message) => {
-    alert(message);
+socket.on("messageRead", (data) => {
+    const { messageId, readBy } = data;
+    // Update message status in UI - change to "seen"
+    updateMessageStatus(messageId, "seen");
+    
+    // Update in chats data
+    for (const chatUser in chats) {
+        const message = chats[chatUser].messages.find(m => m.id === messageId);
+        if (message) {
+            message.read = true;
+            message.readAt = new Date().toISOString();
+            break;
+        }
+    }
 });
 
 socket.on("messageEdited", (data) => {
@@ -1775,10 +2059,13 @@ function replyToMessage(messageId) {
 }
 
 function addMessage(data) {
+    console.log("Adding message to DOM:", data.msg || data.type || "unknown");
     const div = document.createElement("div");
     const isMe = data.from === user;
     div.className = "msg " + (isMe ? "me" : "other");
-    div.setAttribute("data-id", data.tempId || data.id || Date.now());
+    const msgId = data.tempId || data.id || Date.now();
+    div.setAttribute("data-id", msgId);
+    div.setAttribute("data-status", data.status || "sending");
 
     let contentHtml = "";
     let messageId = data.id || data.tempId || Date.now();
@@ -1811,7 +2098,25 @@ function addMessage(data) {
     } else if (data.type === "audio") {
         if (data.audioBase64) {
             const audioSrc = `data:audio/webm;base64,${data.audioBase64}`;
-            contentHtml = `<audio controls src="${audioSrc}"></audio>`;
+            const audioPlayerId = `audio-player-${messageId}`;
+            contentHtml = `
+                <div class="audio-player" id="${audioPlayerId}">
+                    <button class="audio-play-btn" type="button" onclick="toggleAudio('${audioPlayerId}')">
+                        <i class="fas fa-play"></i>
+                    </button>
+                    <div class="audio-waveform">
+                        <span class="audio-wave"></span>
+                        <span class="audio-wave"></span>
+                        <span class="audio-wave"></span>
+                        <span class="audio-wave"></span>
+                        <span class="audio-wave"></span>
+                    </div>
+                    <div class="audio-meta">
+                        <div class="audio-progress-bar"><div class="audio-progress"></div></div>
+                        <div class="audio-duration" id="${audioPlayerId}-duration">00:00</div>
+                    </div>
+                    <audio id="${audioPlayerId}-source" class="audio-source" src="${audioSrc}"></audio>
+                </div>`;
         } else {
             contentHtml = `<div>[Audio message could not be loaded]</div>`;
         }
@@ -1826,6 +2131,9 @@ function addMessage(data) {
 
     const replyHtml = data.replyTo ? `<div class="message-reply-preview">Replying to <strong>@${data.replyTo.from}</strong>: ${processMentions(data.replyTo.text)}</div>` : "";
     const time = data.time ? new Date(data.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) : new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+    
+    const statusClass = data.status || "sending";
+    const statusIndicator = isMe ? `<div class="message-status" data-status="${statusClass}">${getMessageStatusHtml(statusClass)}</div>` : '';
 
     div.innerHTML = `
         ${!isMe ? '<img src="' + (data.avatar || getDefaultAvatar(data.from)) + '" class="avatar">' : ''}
@@ -1833,6 +2141,7 @@ function addMessage(data) {
             ${replyHtml}
             ${contentHtml}
             <div class="message-time">${time}</div>
+            ${statusIndicator}
             <div class="message-actions">
                 <button class="action-btn" onclick="showReactionModal('${messageId}')">😀</button>
                 <button class="action-btn" onclick="replyToMessage('${messageId}')">Reply</button>
@@ -1844,9 +2153,149 @@ function addMessage(data) {
         ${isMe ? '<img src="' + avatar + '" class="avatar">' : ''}
     `;
 
+    console.log("Message div created with id:", msgId, "content preview:", contentHtml.substring(0, 50));
     document.getElementById("messages").appendChild(div);
+    console.log("Message appended, total messages in DOM:", document.getElementById("messages").childElementCount);
     updateMessageReactions(messageId);
     document.getElementById("messages").scrollTop = document.getElementById("messages").scrollHeight;
+    initializeAudioPlayer(messageId);
+
+    // Send read receipt for incoming messages
+    if (!isMe && data.from && data.id) {
+        socket.emit("messageRead", { messageId: data.id, from: data.from });
+    }
+}
+
+function initializeAudioPlayer(messageId) {
+    const playerId = `audio-player-${messageId}`;
+    const player = document.getElementById(playerId);
+    if (!player) return;
+
+    const audioEl = document.getElementById(`${playerId}-source`);
+    const progressBar = player.querySelector('.audio-progress');
+    const durationLabel = document.getElementById(`${playerId}-duration`);
+    const playIcon = player.querySelector('.audio-play-btn i');
+
+    if (!audioEl || !progressBar || !durationLabel || !playIcon) return;
+
+    audioEl.addEventListener('loadedmetadata', () => {
+        durationLabel.textContent = formatTime(audioEl.duration);
+    });
+
+    audioEl.addEventListener('timeupdate', () => {
+        const progress = audioEl.duration ? (audioEl.currentTime / audioEl.duration) * 100 : 0;
+        progressBar.style.width = `${progress}%`;
+        durationLabel.textContent = formatTime(audioEl.currentTime);
+    });
+
+    audioEl.addEventListener('ended', () => {
+        playIcon.className = 'fas fa-play';
+        progressBar.style.width = '0%';
+        durationLabel.textContent = formatTime(audioEl.duration);
+    });
+}
+
+function toggleAudio(playerId) {
+    const player = document.getElementById(playerId);
+    if (!player) return;
+
+    const audioEl = document.getElementById(`${playerId}-source`);
+    const playIcon = player.querySelector('.audio-play-btn i');
+    if (!audioEl || !playIcon) return;
+
+    document.querySelectorAll('.audio-source').forEach((audio) => {
+        if (audio.id !== `${playerId}-source`) {
+            audio.pause();
+            const otherPlayIcon = document.querySelector(`#${audio.id.replace('-source', '')} .audio-play-btn i`);
+            if (otherPlayIcon) otherPlayIcon.className = 'fas fa-play';
+        }
+    });
+
+    if (audioEl.paused) {
+        audioEl.play().catch(() => {});
+        playIcon.className = 'fas fa-pause';
+    } else {
+        audioEl.pause();
+        playIcon.className = 'fas fa-play';
+    }
+}
+
+function formatTime(seconds) {
+    if (!seconds || isNaN(seconds)) return '00:00';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+// Update message status (sending → sent → seen)
+function getMessageStatusHtml(status) {
+    const labels = {
+        sending: "Sending",
+        sent: "Sent",
+        seen: "Seen",
+        failed: "Failed"
+    };
+    const icons = {
+        sending: "fa-paper-plane",
+        sent: "fa-check",
+        seen: "fa-check-double",
+        failed: "fa-exclamation-circle"
+    };
+    return `<i class="fas ${icons[status] || "fa-paper-plane"}"></i><span>${labels[status] || "Sending"}</span>`;
+}
+
+function updateMessageStatus(msgId, status) {
+    let msgEl = document.querySelector(`[data-id="${msgId}"]`);
+    if (!msgEl) {
+        msgEl = Array.from(document.querySelectorAll('[data-id]')).find(el => {
+            const elementId = el.getAttribute('data-id');
+            return elementId === msgId;
+        }) || null;
+    }
+    if (msgEl) {
+        msgEl.setAttribute("data-status", status);
+        const statusDiv = msgEl.querySelector(".message-status");
+        if (statusDiv) {
+            statusDiv.setAttribute("data-status", status);
+            statusDiv.innerHTML = getMessageStatusHtml(status);
+        }
+    }
+    for (const chatUser in chats) {
+        const message = getMessageById(chatUser, msgId);
+        if (message) {
+            message.status = status;
+            break;
+        }
+    }
+}
+
+function sendEncryptedMessage(payload, tempId, retryCount = 0) {
+    if (!socket.connected) {
+        enqueuePendingMessage(payload, tempId, retryCount);
+        console.warn(`Socket disconnected, queued message ${tempId} for later delivery.`);
+        return;
+    }
+
+    const ackTimeout = setTimeout(() => {
+        console.warn(`Still waiting for server ack for message ${tempId}. Keeping it in sending state.`);
+    }, 2000); // Reduced from 7000 to 2000ms
+
+    socket.emit("message", payload, (ack) => {
+        clearTimeout(ackTimeout);
+        if (ack && ack.success) {
+            updateMessageStatus(tempId, "sent");
+        } else if (ack && !ack.success) {
+            if (retryCount < 2) {
+                console.warn(`Retrying message ${tempId} after transient error:`, ack.error || ack);
+                setTimeout(() => sendEncryptedMessage(payload, tempId, retryCount + 1), 500); // Reduced from 1200 to 500ms
+            } else {
+                console.error(`Message ${tempId} failed after retries:`, ack.error || ack);
+                console.warn(`Message ${tempId} will remain in sending state until server confirmation.`);
+            }
+        } else {
+            console.warn(`No ack payload received for ${tempId}. Message remains sending until confirmation.`);
+        }
+    });
 }
 
 function formatFileSize(bytes) {
@@ -2033,14 +2482,31 @@ async function getPublicKeyFor(username) {
     if (publicKeys[username]) {
         return publicKeys[username];
     }
-    const response = await fetch(`/publicKey/${encodeURIComponent(username)}`);
-    const data = await response.json();
-    if (!data.success) {
-        throw new Error(data.error || "Unable to fetch public key");
+    if (publicKeyPromises[username]) {
+        return publicKeyPromises[username];
     }
-    const imported = await importPublicKey(data.publicKey);
-    publicKeys[username] = imported;
-    return imported;
+
+    publicKeyPromises[username] = (async () => {
+        const response = await fetch(`/publicKey/${encodeURIComponent(username)}`);
+        const data = await response.json();
+        if (!data.success) {
+            throw new Error(data.error || "Unable to fetch public key");
+        }
+        const imported = await importPublicKey(data.publicKey);
+        publicKeys[username] = imported;
+        delete publicKeyPromises[username];
+        return imported;
+    })();
+
+    return publicKeyPromises[username];
+}
+
+function prefetchPublicKey(username) {
+    if (!username || username === user) return;
+    if (publicKeys[username] || publicKeyPromises[username]) return;
+    getPublicKeyFor(username).catch(() => {
+        // Ignore fetch errors for now; public key will be loaded on demand.
+    });
 }
 
 async function encryptMessage(plaintext, recipientPublicKey, senderPublicKey, recipientUsername) {
@@ -2238,3 +2704,6 @@ socket.on("callEnded", (data) => {
         alert("Call ended by " + data.from);
     }
 });
+
+// Initialize theme on load
+initTheme();

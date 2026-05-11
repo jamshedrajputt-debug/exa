@@ -8,7 +8,8 @@ const path = require("path");
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*" }
+    cors: { origin: "*" },
+    maxHttpBufferSize: 10 * 1024 * 1024
 });
 
 app.use(express.static("public"));
@@ -35,11 +36,18 @@ function readJson(filePath, defaultValue) {
 }
 
 function saveJson(filePath, data) {
-    try {
-        fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-    } catch (err) {
-        console.error(`Failed to save ${filePath}:`, err.message);
+    // Debounce saves to improve performance
+    if (saveJson.timeouts && saveJson.timeouts[filePath]) {
+        clearTimeout(saveJson.timeouts[filePath]);
     }
+    if (!saveJson.timeouts) saveJson.timeouts = {};
+    saveJson.timeouts[filePath] = setTimeout(() => {
+        try {
+            fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+        } catch (err) {
+            console.error(`Failed to save ${filePath}:`, err.message);
+        }
+    }, 50); // Reduced from 100 to 50ms
 }
 
 users = readJson(usersFile, {});
@@ -299,19 +307,37 @@ io.on("connection", (socket) => {
         }
     });
 
-    socket.on("message", (data) => {
+    socket.on("message", (data, callback) => {
         if (!socket.username) return;
         const { to, ciphertext, iv, encryptedKeys, tempId, type } = data;
-        if (!ciphertext || !iv || !encryptedKeys || !to || to === socket.username) return;
+        if (!ciphertext || !iv || !encryptedKeys || !to || to === socket.username) {
+            if (callback) callback({ success: false, error: "Invalid message payload" });
+            return;
+        }
         if (!users[to]) {
+            if (callback) callback({ success: false, error: "Recipient not found" });
             return socket.emit("errorMessage", "Recipient not found");
         }
 
         if (!encryptedKeys[to] || !encryptedKeys[socket.username]) {
+            if (callback) callback({ success: false, error: "Encrypted message keys are missing" });
             return socket.emit("errorMessage", "Encrypted message keys are missing");
         }
 
-        const messageId = tempId || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        if (tempId) {
+            const duplicate = messages.find(m => m.tempId === tempId && m.from === socket.username && m.to === to);
+            if (duplicate) {
+                if (callback) callback({ success: true, id: duplicate.id });
+                socket.emit("message", duplicate);
+                const targetSocketId = userSockets[to];
+                if (targetSocketId) {
+                    io.to(targetSocketId).emit("message", duplicate);
+                }
+                return;
+            }
+        }
+
+        const messageId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
         const message = {
             id: messageId,
             from: socket.username,
@@ -320,7 +346,7 @@ io.on("connection", (socket) => {
             ciphertext,
             iv,
             encryptedKeys,
-            tempId: messageId,
+            tempId: tempId || messageId,
             avatar: users[socket.username].avatar || "",
             time: new Date().toISOString()
         };
@@ -334,6 +360,7 @@ io.on("connection", (socket) => {
         }
 
         saveMessages();
+        if (callback) callback({ success: true, id: messageId });
     });
 
     socket.on("typing", (to) => {
@@ -408,16 +435,21 @@ io.on("connection", (socket) => {
         }
     });
 
-    socket.on("addReaction", (data) => {
+    socket.on("messageRead", (data) => {
         if (!socket.username) return;
-        const { messageId, emoji } = data;
-        // In a real implementation, you'd store reactions in the database
-        // For now, we'll just broadcast the reaction
-        io.emit("addReaction", {
-            messageId,
-            emoji,
-            from: socket.username
-        });
+        const { messageId, from } = data;
+        // Mark message as read
+        const message = messages.find(m => m.id === messageId && m.to === socket.username && m.from === from);
+        if (message) {
+            message.read = true;
+            message.readAt = new Date().toISOString();
+            saveMessages();
+            // Notify sender that message was read
+            const senderSocketId = userSockets[from];
+            if (senderSocketId) {
+                io.to(senderSocketId).emit("messageRead", { messageId, readBy: socket.username });
+            }
+        }
     });
 });
 

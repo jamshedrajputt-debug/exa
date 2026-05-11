@@ -139,13 +139,13 @@
 
 /* Message animations */
 .msg {
-    animation: slideIn 0.3s ease-out;
+    animation: slideIn 0.14s ease-out;
 }
 
 @keyframes slideIn {
     from {
         opacity: 0;
-        transform: translateY(10px);
+        transform: translateY(6px);
     }
     to {
         opacity: 1;
@@ -156,19 +156,50 @@
 /* Enhanced bubbles */
 .bubble {
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-    transition: all 0.2s ease;
+    transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 
 .bubble:hover {
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
-/* Message time styling */
-.message-time {
+/* Message status styling */
+.message-status {
     font-size: 11px;
-    opacity: 0.7;
-    margin-top: 6px;
+    opacity: 0.8;
+    margin-top: 4px;
     text-align: right;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    justify-content: flex-end;
+    color: rgba(255,255,255,0.75);
+}
+
+.message-status[data-status="sending"] {
+    color: #fbbf24;
+}
+
+.message-status[data-status="sent"] {
+    color: #93c5fd;
+}
+
+.message-status[data-status="seen"] {
+    color: #60a5fa;
+}
+
+.message-status[data-status="failed"] {
+    color: #f87171;
+}
+
+.message-status i {
+    font-size: 10px;
+}
+
+.message-status span {
+    font-size: 10px;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
 }
 
 /* Message actions */
@@ -351,26 +382,83 @@
     }
 }
 
-/* Advanced modal animations */
-.modal {
-    animation: fadeIn 0.2s ease;
+/* Theme selector styling */
+.theme-selector {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
 }
 
-.modal-content {
-    animation: slideUp 0.3s ease;
+.theme-selector label {
+    font-weight: 500;
+    color: #e2e8f0;
 }
 
-/* Header button enhancements */
-.header-btn {
-    position: relative;
+.theme-selector select {
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(71, 85, 105, 0.5);
+    background: rgba(71, 85, 105, 0.15);
+    color: #e2e8f0;
+    font-size: 14px;
+}
+
+.theme-selector select:focus {
+    outline: none;
+    border-color: #60a5fa;
+}
+
+/* Enhanced button animations */
+button {
     transition: all 0.2s ease;
 }
 
-.header-btn:hover {
-    transform: scale(1.1);
-    color: #60a5fa;
+button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
 }
 
-.header-btn i {
-    font-size: 18px;
+.send-btn:hover {
+    transform: scale(1.05);
+    box-shadow: 0 6px 20px rgba(0, 149, 246, 0.4);
+}
+
+.input-btn:hover {
+    background: rgba(37, 99, 235, 0.2);
+    transform: scale(1.05);
+}
+
+/* Icon improvements */
+.fas, .far, .fab {
+    transition: all 0.2s ease;
+}
+
+.header-btn:hover .fas {
+    color: #60a5fa;
+    transform: scale(1.1);
+}
+
+.input-btn:hover .fas {
+    transform: scale(1.1);
+}
+
+/* Loading animations */
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
+}
+
+.loading {
+    animation: pulse 1.5s infinite;
+}
+
+/* Message bubble enhancements */
+.bubble {
+    transition: all 0.3s ease;
+}
+
+.bubble:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.4);
 }
