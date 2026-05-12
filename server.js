@@ -270,185 +270,331 @@ app.post("/deleteAccount", async (req, res) => {
 });
 
 io.on("connection", (socket) => {
+    socket.on("error", (err) => {
+        console.error(`[socket error] id=${socket.id} user=${socket.username || "unauthenticated"}:`, err.message);
+        socket.emit("errorMessage", "A socket error occurred. Please reconnect.");
+    });
+
     socket.on("join", (username) => {
-        if (!username || !users[username]) {
-            return socket.emit("errorMessage", "Invalid or unknown user");
-        }
+        try {
+            if (!username || typeof username !== "string" || username.trim() === "") {
+                return socket.emit("errorMessage", "Invalid username");
+            }
+            const sanitized = username.trim();
+            if (!users[sanitized]) {
+                return socket.emit("errorMessage", "Invalid or unknown user");
+            }
 
-        if (socket.username && socket.username !== username) {
-            delete onlineUsers[socket.username];
-            delete userSockets[socket.username];
-        }
+            if (socket.username && socket.username !== sanitized) {
+                delete onlineUsers[socket.username];
+                delete userSockets[socket.username];
+            }
 
-        socket.username = username;
-        onlineUsers[username] = true;
-        userSockets[username] = socket.id;
+            socket.username = sanitized;
+            onlineUsers[sanitized] = true;
+            userSockets[sanitized] = socket.id;
 
-        const privateMessages = messages.filter(
-            (message) => {
+            const privateMessages = messages.filter((message) => {
                 // Handle old format messages
                 if (message.user) {
-                    return message.user === username;
+                    return message.user === sanitized;
                 }
                 // New format
-                return message.from === username || message.to === username;
-            }
-        );
+                return message.from === sanitized || message.to === sanitized;
+            });
 
-        socket.emit("loadMessages", privateMessages);
-        io.emit("onlineUsers", Object.keys(onlineUsers));
+            socket.emit("loadMessages", privateMessages);
+            io.emit("onlineUsers", Object.keys(onlineUsers));
+        } catch (err) {
+            console.error(`[join] user=${username}:`, err.message);
+            socket.emit("errorMessage", "Failed to join. Please try again.");
+        }
     });
 
     socket.on("disconnect", () => {
-        if (socket.username) {
-            delete onlineUsers[socket.username];
-            delete userSockets[socket.username];
-            io.emit("onlineUsers", Object.keys(onlineUsers));
+        try {
+            if (socket.username) {
+                delete onlineUsers[socket.username];
+                delete userSockets[socket.username];
+                io.emit("onlineUsers", Object.keys(onlineUsers));
+            }
+        } catch (err) {
+            console.error(`[disconnect] user=${socket.username || "unknown"}:`, err.message);
         }
     });
 
     socket.on("message", (data, callback) => {
-        if (!socket.username) return;
-        const { to, ciphertext, iv, encryptedKeys, tempId, type } = data;
-        if (!ciphertext || !iv || !encryptedKeys || !to || to === socket.username) {
-            if (callback) callback({ success: false, error: "Invalid message payload" });
-            return;
-        }
-        if (!users[to]) {
-            if (callback) callback({ success: false, error: "Recipient not found" });
-            return socket.emit("errorMessage", "Recipient not found");
-        }
-
-        if (!encryptedKeys[to] || !encryptedKeys[socket.username]) {
-            if (callback) callback({ success: false, error: "Encrypted message keys are missing" });
-            return socket.emit("errorMessage", "Encrypted message keys are missing");
-        }
-
-        if (tempId) {
-            const duplicate = messages.find(m => m.tempId === tempId && m.from === socket.username && m.to === to);
-            if (duplicate) {
-                if (callback) callback({ success: true, id: duplicate.id });
-                socket.emit("message", duplicate);
-                const targetSocketId = userSockets[to];
-                if (targetSocketId) {
-                    io.to(targetSocketId).emit("message", duplicate);
-                }
+        try {
+            if (!socket.username) {
+                if (callback) callback({ success: false, error: "Not authenticated" });
                 return;
             }
+            if (!data || typeof data !== "object") {
+                if (callback) callback({ success: false, error: "Invalid message payload" });
+                return;
+            }
+
+            const { to, ciphertext, iv, encryptedKeys, tempId, type } = data;
+
+            if (!to || typeof to !== "string" || to.trim() === "") {
+                if (callback) callback({ success: false, error: "Invalid recipient" });
+                return;
+            }
+            if (to === socket.username) {
+                if (callback) callback({ success: false, error: "Cannot send message to yourself" });
+                return;
+            }
+            if (!ciphertext || !iv || !encryptedKeys) {
+                if (callback) callback({ success: false, error: "Invalid message payload" });
+                return;
+            }
+            if (!users[to]) {
+                if (callback) callback({ success: false, error: "Recipient not found" });
+                return socket.emit("errorMessage", "Recipient not found");
+            }
+            if (!encryptedKeys[to] || !encryptedKeys[socket.username]) {
+                if (callback) callback({ success: false, error: "Encrypted message keys are missing" });
+                return socket.emit("errorMessage", "Encrypted message keys are missing");
+            }
+
+            if (tempId) {
+                const duplicate = messages.find(m => m.tempId === tempId && m.from === socket.username && m.to === to);
+                if (duplicate) {
+                    if (callback) callback({ success: true, id: duplicate.id });
+                    socket.emit("message", duplicate);
+                    const targetSocketId = userSockets[to];
+                    if (targetSocketId) {
+                        io.to(targetSocketId).emit("message", duplicate);
+                    }
+                    return;
+                }
+            }
+
+            const messageId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            const message = {
+                id: messageId,
+                from: socket.username,
+                to,
+                type: type || "text",
+                ciphertext,
+                iv,
+                encryptedKeys,
+                tempId: tempId || messageId,
+                avatar: users[socket.username].avatar || "",
+                time: new Date().toISOString()
+            };
+
+            messages.push(message);
+
+            socket.emit("message", message);
+            const targetSocketId = userSockets[to];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("message", message);
+            }
+
+            try {
+                saveMessages();
+            } catch (saveErr) {
+                console.error(`[message] saveMessages failed for id=${messageId}:`, saveErr.message);
+            }
+
+            if (callback) callback({ success: true, id: messageId });
+        } catch (err) {
+            console.error(`[message] user=${socket.username || "unknown"}:`, err.message);
+            if (callback) callback({ success: false, error: "Failed to send message. Please try again." });
+            socket.emit("errorMessage", "Failed to send message. Please try again.");
         }
-
-        const messageId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        const message = {
-            id: messageId,
-            from: socket.username,
-            to,
-            type: type || "text",
-            ciphertext,
-            iv,
-            encryptedKeys,
-            tempId: tempId || messageId,
-            avatar: users[socket.username].avatar || "",
-            time: new Date().toISOString()
-        };
-
-        messages.push(message);
-
-        socket.emit("message", message);
-        const targetSocketId = userSockets[to];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("message", message);
-        }
-
-        saveMessages();
-        if (callback) callback({ success: true, id: messageId });
     });
 
     socket.on("typing", (to) => {
-        if (!socket.username || !to || to === socket.username) return;
-        const targetSocketId = userSockets[to];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("typing", socket.username);
+        try {
+            if (!socket.username || !to || typeof to !== "string" || to === socket.username) return;
+            const targetSocketId = userSockets[to];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("typing", socket.username);
+            }
+        } catch (err) {
+            console.error(`[typing] user=${socket.username || "unknown"}:`, err.message);
         }
     });
 
     socket.on("stopTyping", (to) => {
-        if (!socket.username || !to || to === socket.username) return;
-        const targetSocketId = userSockets[to];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("stopTyping", socket.username);
+        try {
+            if (!socket.username || !to || typeof to !== "string" || to === socket.username) return;
+            const targetSocketId = userSockets[to];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("stopTyping", socket.username);
+            }
+        } catch (err) {
+            console.error(`[stopTyping] user=${socket.username || "unknown"}:`, err.message);
         }
     });
 
     socket.on("callUser", (data) => {
-        if (!socket.username || !data.to || data.to === socket.username) return;
-        const targetSocketId = userSockets[data.to];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("callMade", { offer: data.offer, from: socket.username });
+        try {
+            if (!socket.username || !data || !data.to || typeof data.to !== "string" || data.to === socket.username) return;
+            const targetSocketId = userSockets[data.to];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("callMade", { offer: data.offer, from: socket.username });
+            }
+        } catch (err) {
+            console.error(`[callUser] user=${socket.username || "unknown"}:`, err.message);
         }
     });
 
     socket.on("answerCall", (data) => {
-        if (!socket.username || !data.to) return;
-        const targetSocketId = userSockets[data.to];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("callAnswered", { answer: data.answer, from: socket.username });
+        try {
+            if (!socket.username || !data || !data.to || typeof data.to !== "string") return;
+            const targetSocketId = userSockets[data.to];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("callAnswered", { answer: data.answer, from: socket.username });
+            }
+        } catch (err) {
+            console.error(`[answerCall] user=${socket.username || "unknown"}:`, err.message);
         }
     });
 
     socket.on("iceCandidate", (data) => {
-        if (!socket.username || !data.to) return;
-        const targetSocketId = userSockets[data.to];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("iceCandidate", { candidate: data.candidate, from: socket.username });
+        try {
+            if (!socket.username || !data || !data.to || typeof data.to !== "string") return;
+            const targetSocketId = userSockets[data.to];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("iceCandidate", { candidate: data.candidate, from: socket.username });
+            }
+        } catch (err) {
+            console.error(`[iceCandidate] user=${socket.username || "unknown"}:`, err.message);
         }
     });
 
     socket.on("endCall", (data) => {
-        if (!socket.username || !data.to) return;
-        const targetSocketId = userSockets[data.to];
-        if (targetSocketId) {
-            io.to(targetSocketId).emit("callEnded", { from: socket.username });
+        try {
+            if (!socket.username || !data || !data.to || typeof data.to !== "string") return;
+            const targetSocketId = userSockets[data.to];
+            if (targetSocketId) {
+                io.to(targetSocketId).emit("callEnded", { from: socket.username });
+            }
+        } catch (err) {
+            console.error(`[endCall] user=${socket.username || "unknown"}:`, err.message);
         }
     });
 
-    socket.on("editMessage", (data) => {
-        if (!socket.username) return;
-        const { id, newText } = data;
-        const message = messages.find(m => m.id === id && m.from === socket.username);
-        if (message) {
+    socket.on("editMessage", (data, callback) => {
+        try {
+            if (!socket.username) {
+                if (callback) callback({ success: false, error: "Not authenticated" });
+                return;
+            }
+            if (!data || typeof data !== "object") {
+                if (callback) callback({ success: false, error: "Invalid payload" });
+                return;
+            }
+            const { id, newText } = data;
+            if (!id || typeof id !== "string") {
+                if (callback) callback({ success: false, error: "Invalid message ID" });
+                return;
+            }
+            if (newText === undefined || newText === null) {
+                if (callback) callback({ success: false, error: "New message text is required" });
+                return;
+            }
+            const message = messages.find(m => m.id === id && m.from === socket.username);
+            if (!message) {
+                if (callback) callback({ success: false, error: "Message not found or not owned by you" });
+                return;
+            }
             message.msg = newText;
             message.edited = true;
             message.editedAt = new Date().toISOString();
-            saveMessages();
+            try {
+                saveMessages();
+            } catch (saveErr) {
+                console.error(`[editMessage] saveMessages failed for id=${id}:`, saveErr.message);
+            }
             io.emit("messageEdited", { id, newText, edited: true, editedAt: message.editedAt });
+            if (callback) callback({ success: true });
+        } catch (err) {
+            console.error(`[editMessage] user=${socket.username || "unknown"}:`, err.message);
+            if (callback) callback({ success: false, error: "Failed to edit message. Please try again." });
+            socket.emit("errorMessage", "Failed to edit message. Please try again.");
         }
     });
 
-    socket.on("deleteMessage", (data) => {
-        if (!socket.username) return;
-        const { id } = data;
-        const messageIndex = messages.findIndex(m => m.id === id && m.from === socket.username);
-        if (messageIndex !== -1) {
-            const [removed] = messages.splice(messageIndex, 1);
-            saveMessages();
+    socket.on("deleteMessage", (data, callback) => {
+        try {
+            if (!socket.username) {
+                if (callback) callback({ success: false, error: "Not authenticated" });
+                return;
+            }
+            if (!data || typeof data !== "object") {
+                if (callback) callback({ success: false, error: "Invalid payload" });
+                return;
+            }
+            const { id } = data;
+            if (!id || typeof id !== "string") {
+                if (callback) callback({ success: false, error: "Invalid message ID" });
+                return;
+            }
+            const messageIndex = messages.findIndex(m => m.id === id && m.from === socket.username);
+            if (messageIndex === -1) {
+                if (callback) callback({ success: false, error: "Message not found or not owned by you" });
+                return;
+            }
+            messages.splice(messageIndex, 1);
+            try {
+                saveMessages();
+            } catch (saveErr) {
+                console.error(`[deleteMessage] saveMessages failed for id=${id}:`, saveErr.message);
+            }
             io.emit("messageDeleted", { id });
+            if (callback) callback({ success: true });
+        } catch (err) {
+            console.error(`[deleteMessage] user=${socket.username || "unknown"}:`, err.message);
+            if (callback) callback({ success: false, error: "Failed to delete message. Please try again." });
+            socket.emit("errorMessage", "Failed to delete message. Please try again.");
         }
     });
 
-    socket.on("messageRead", (data) => {
-        if (!socket.username) return;
-        const { messageId, from } = data;
-        // Mark message as read
-        const message = messages.find(m => m.id === messageId && m.to === socket.username && m.from === from);
-        if (message) {
+    socket.on("messageRead", (data, callback) => {
+        try {
+            if (!socket.username) {
+                if (callback) callback({ success: false, error: "Not authenticated" });
+                return;
+            }
+            if (!data || typeof data !== "object") {
+                if (callback) callback({ success: false, error: "Invalid payload" });
+                return;
+            }
+            const { messageId, from } = data;
+            if (!messageId || typeof messageId !== "string") {
+                if (callback) callback({ success: false, error: "Invalid message ID" });
+                return;
+            }
+            if (!from || typeof from !== "string") {
+                if (callback) callback({ success: false, error: "Invalid sender" });
+                return;
+            }
+            const message = messages.find(m => m.id === messageId && m.to === socket.username && m.from === from);
+            if (!message) {
+                if (callback) callback({ success: false, error: "Message not found" });
+                return;
+            }
             message.read = true;
             message.readAt = new Date().toISOString();
-            saveMessages();
+            try {
+                saveMessages();
+            } catch (saveErr) {
+                console.error(`[messageRead] saveMessages failed for id=${messageId}:`, saveErr.message);
+            }
             // Notify sender that message was read
             const senderSocketId = userSockets[from];
             if (senderSocketId) {
                 io.to(senderSocketId).emit("messageRead", { messageId, readBy: socket.username });
             }
+            if (callback) callback({ success: true });
+        } catch (err) {
+            console.error(`[messageRead] user=${socket.username || "unknown"}:`, err.message);
+            if (callback) callback({ success: false, error: "Failed to mark message as read." });
+            socket.emit("errorMessage", "Failed to mark message as read.");
         }
     });
 });
@@ -457,3 +603,30 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Pro Chat Secure server running on http://localhost:${PORT}`);
 });
+
+// --- Global process error handlers ---
+
+process.on("uncaughtException", (err) => {
+    console.error("[uncaughtException] Unhandled exception — server will continue:", err.message, err.stack);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+    console.error("[unhandledRejection] Unhandled promise rejection:", reason);
+});
+
+// --- Memory usage monitoring ---
+
+const MEMORY_WARN_THRESHOLD_MB = 400;
+const MEMORY_CHECK_INTERVAL_MS = 30_000;
+
+setInterval(() => {
+    const { heapUsed, heapTotal, rss } = process.memoryUsage();
+    const heapUsedMB = Math.round(heapUsed / 1024 / 1024);
+    const heapTotalMB = Math.round(heapTotal / 1024 / 1024);
+    const rssMB = Math.round(rss / 1024 / 1024);
+    if (heapUsedMB >= MEMORY_WARN_THRESHOLD_MB) {
+        console.warn(
+            `[memory] WARNING: heap usage is high — heapUsed=${heapUsedMB}MB heapTotal=${heapTotalMB}MB rss=${rssMB}MB`
+        );
+    }
+}, MEMORY_CHECK_INTERVAL_MS).unref();
