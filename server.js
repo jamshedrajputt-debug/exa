@@ -295,8 +295,42 @@ io.on("connection", (socket) => {
             }
         );
 
-        socket.emit("loadMessages", privateMessages);
+        // Send only the most recent 20 messages to avoid heap exhaustion
+        // from JSON.stringify-ing large encrypted payloads all at once.
+        const PAGE_SIZE = 20;
+        const recentMessages = privateMessages.slice(-PAGE_SIZE);
+        socket.emit("loadMessages", recentMessages, { hasMore: privateMessages.length > PAGE_SIZE });
         io.emit("onlineUsers", Object.keys(onlineUsers));
+    });
+
+    socket.on("loadMoreMessages", (data) => {
+        if (!socket.username) return;
+        const { username, offset = 0, limit = 20 } = data || {};
+        if (!username || username !== socket.username) return;
+
+        const privateMessages = messages.filter((message) => {
+            if (message.user) {
+                return message.user === username;
+            }
+            return message.from === username || message.to === username;
+        });
+
+        // Serve older messages in reverse-chronological pages.
+        // offset=0 means "start from the oldest end of what hasn't been sent yet",
+        // i.e. we exclude the last PAGE_SIZE already delivered on join.
+        const total = privateMessages.length;
+        const PAGE_SIZE = 20;
+        const alreadySent = PAGE_SIZE;
+        const remaining = privateMessages.slice(0, total - alreadySent);
+        const page = remaining.slice(
+            Math.max(0, remaining.length - alreadySent - offset),
+            remaining.length - offset
+        );
+
+        socket.emit("moreMessages", {
+            messages: page,
+            hasMore: offset + page.length < remaining.length
+        });
     });
 
     socket.on("disconnect", () => {
